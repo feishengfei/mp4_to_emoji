@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract an MP4 into PNG frames, clear selected regions, and rebuild it."""
+"""Extract an MP4 into PNG frames, clear regions or keep detected outlines."""
 
 from __future__ import annotations
 
@@ -10,11 +10,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-from PIL import Image
+import numpy as np
+from scipy import ndimage
+from PIL import Image, ImageChops, ImageDraw, ImageFilter
 
 
 FRAME_PATTERN = "%08d.png"
 FRAME_NAME_RE = re.compile(r"^\d+\.png$")
+FOREGROUND_MARGIN = 10
+FOREGROUND_COMPONENT_GAP = 20
 
 
 def run_command(command: list[str]) -> None:
@@ -86,6 +90,64 @@ def modify_frames(
             reset_region(image_path, region)
 
 
+def foreground_mask(image_path: Path) -> Image.Image:
+    with Image.open(image_path) as source:
+        red, green, blue = source.convert("RGB").split()
+    gray = Image.merge("RGB", (red, green, blue)).convert("L")
+    brightest = ImageChops.lighter(ImageChops.lighter(red, green), blue)
+    darkest = ImageChops.darker(ImageChops.darker(red, green), blue)
+    chroma = ImageChops.subtract(brightest, darkest)
+    candidate = Image.new("L", gray.size, 0)
+    for y in range(gray.height):
+        for x in range(gray.width):
+            if gray.getpixel((x, y)) >= 190 and chroma.getpixel((x, y)) <= 18:
+                candidate.putpixel((x, y), 255)
+
+    # Close small gaps around the outline before removing edge-connected background.
+    candidate = candidate.filter(ImageFilter.MaxFilter(9)).filter(
+        ImageFilter.MinFilter(9)
+    )
+    background = ImageChops.invert(candidate)
+    for point in (
+        (0, 0),
+        (background.width - 1, 0),
+        (0, background.height - 1),
+        (background.width - 1, background.height - 1),
+    ):
+        ImageDraw.floodfill(background, point, 128, thresh=0)
+    foreground = background.point(lambda value: 0 if value == 128 else 255)
+    foreground_array = np.asarray(foreground, dtype=np.uint8) > 0
+    labels, count = ndimage.label(foreground_array, structure=np.ones((3, 3)))
+    if count:
+        sizes = np.bincount(labels.ravel())
+        main_label = int(np.argmax(sizes[1:]) + 1)
+        main_component = labels == main_label
+        distance = ndimage.distance_transform_edt(~main_component)
+        foreground_array &= distance <= FOREGROUND_COMPONENT_GAP
+        foreground = Image.fromarray(
+            np.where(foreground_array, 255, 0).astype(np.uint8), mode="L"
+        )
+    kernel_size = FOREGROUND_MARGIN * 2 + 1
+    expanded = foreground.filter(ImageFilter.MaxFilter(kernel_size))
+    return expanded.point(lambda value: 1 if value else 0, mode="1")
+
+
+def modify_with_foreground_masks(files: list[Path]) -> list[Path]:
+    masked_frames = []
+    for image_path in files:
+        mask_path = image_path.with_name(f"{image_path.stem}_mask.png")
+        and_path = image_path.with_name(f"{image_path.stem}_and.png")
+        mask = foreground_mask(image_path)
+        mask.save(mask_path, format="PNG")
+        with Image.open(image_path) as source:
+            image = source.convert("RGBA")
+        transparent = Image.new("RGBA", image.size, (0, 0, 0, 0))
+        image = Image.composite(image, transparent, mask)
+        image.save(and_path, format="PNG")
+        masked_frames.append(and_path)
+    return masked_frames
+
+
 def input_frame_rate(input_path: Path) -> str:
     try:
         result = subprocess.run(
@@ -114,8 +176,9 @@ def input_frame_rate(input_path: Path) -> str:
     return "30"
 
 
-def rebuild_video(frames_dir: Path, output_mp4: Path, output_gif: Path, rate: str) -> None:
-    input_pattern = str(frames_dir / FRAME_PATTERN)
+def rebuild_video(
+    input_pattern: str, output_mp4: Path, output_gif: Path, rate: str
+) -> None:
     run_command(
         [
             "ffmpeg",
@@ -168,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         type=int,
-        help="region to clear; may be specified multiple times",
+        help="region to clear; without this option, automatically keep outlines",
     )
     return parser
 
@@ -181,8 +244,6 @@ def main() -> int:
         return 2
 
     frames_dir = input_path.with_suffix("")
-    output_mp4 = input_path.with_name(f"{input_path.stem}_redo.mp4")
-    output_gif = input_path.with_name(f"{input_path.stem}_redo.gif")
     try:
         regions = []
         for values in args.region:
@@ -194,13 +255,17 @@ def main() -> int:
                 )
             regions.append(region)
         files = extract_frames(input_path, frames_dir)
-        modify_frames(files, regions)
-        rebuild_video(
-            frames_dir,
-            output_mp4,
-            output_gif,
-            input_frame_rate(input_path),
-        )
+        rate = input_frame_rate(input_path)
+        if regions:
+            output_mp4 = input_path.with_name(f"{input_path.stem}_redo.mp4")
+            output_gif = input_path.with_name(f"{input_path.stem}_redo.gif")
+            modify_frames(files, regions)
+            rebuild_video(str(frames_dir / FRAME_PATTERN), output_mp4, output_gif, rate)
+        else:
+            modify_with_foreground_masks(files)
+            output_mp4 = input_path.with_name(f"{input_path.stem}_and.mp4")
+            output_gif = input_path.with_name(f"{input_path.stem}_and.gif")
+            rebuild_video(str(frames_dir / "%08d_and.png"), output_mp4, output_gif, rate)
     except (RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
