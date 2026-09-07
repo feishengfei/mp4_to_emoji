@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -82,12 +84,36 @@ def reset_region(image_path: Path, region: tuple[int, int, int, int]) -> None:
     image.save(image_path, format="PNG")
 
 
-def modify_frames(
-    files: list[Path], regions: list[tuple[int, int, int, int]]
+def modify_frame_regions(
+    image_path: Path, regions: list[tuple[int, int, int, int]]
 ) -> None:
-    for image_path in files:
-        for region in regions:
-            reset_region(image_path, region)
+    for region in regions:
+        reset_region(image_path, region)
+
+
+def modify_frames(
+    files: list[Path], regions: list[tuple[int, int, int, int]], workers: int
+) -> None:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(lambda path: modify_frame_regions(path, regions), files))
+
+
+def process_foreground_frame(image_path: Path) -> Path:
+    mask_path = image_path.with_name(f"{image_path.stem}_mask.png")
+    and_path = image_path.with_name(f"{image_path.stem}_and.png")
+    mask = foreground_mask(image_path)
+    mask.save(mask_path, format="PNG")
+    with Image.open(image_path) as source:
+        image = source.convert("RGBA")
+    transparent = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    image = Image.composite(image, transparent, mask)
+    image.save(and_path, format="PNG")
+    return and_path
+
+
+def modify_with_foreground_masks(files: list[Path], workers: int) -> list[Path]:
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        return list(executor.map(process_foreground_frame, files))
 
 
 def foreground_mask(image_path: Path) -> Image.Image:
@@ -130,22 +156,6 @@ def foreground_mask(image_path: Path) -> Image.Image:
     kernel_size = FOREGROUND_MARGIN * 2 + 1
     expanded = foreground.filter(ImageFilter.MaxFilter(kernel_size))
     return expanded.point(lambda value: 1 if value else 0, mode="1")
-
-
-def modify_with_foreground_masks(files: list[Path]) -> list[Path]:
-    masked_frames = []
-    for image_path in files:
-        mask_path = image_path.with_name(f"{image_path.stem}_mask.png")
-        and_path = image_path.with_name(f"{image_path.stem}_and.png")
-        mask = foreground_mask(image_path)
-        mask.save(mask_path, format="PNG")
-        with Image.open(image_path) as source:
-            image = source.convert("RGBA")
-        transparent = Image.new("RGBA", image.size, (0, 0, 0, 0))
-        image = Image.composite(image, transparent, mask)
-        image.save(and_path, format="PNG")
-        masked_frames.append(and_path)
-    return masked_frames
 
 
 def input_frame_rate(input_path: Path) -> str:
@@ -255,14 +265,15 @@ def main() -> int:
                 )
             regions.append(region)
         files = extract_frames(input_path, frames_dir)
+        workers = min(os.cpu_count() or 1, len(files))
         rate = input_frame_rate(input_path)
         if regions:
             output_mp4 = input_path.with_name(f"{input_path.stem}_redo.mp4")
             output_gif = input_path.with_name(f"{input_path.stem}_redo.gif")
-            modify_frames(files, regions)
+            modify_frames(files, regions, workers)
             rebuild_video(str(frames_dir / FRAME_PATTERN), output_mp4, output_gif, rate)
         else:
-            modify_with_foreground_masks(files)
+            modify_with_foreground_masks(files, workers)
             output_mp4 = input_path.with_name(f"{input_path.stem}_and.mp4")
             output_gif = input_path.with_name(f"{input_path.stem}_and.gif")
             rebuild_video(str(frames_dir / "%08d_and.png"), output_mp4, output_gif, rate)
