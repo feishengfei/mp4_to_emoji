@@ -21,6 +21,8 @@ FRAME_PATTERN = "%08d.png"
 FRAME_NAME_RE = re.compile(r"^\d+\.png$")
 FOREGROUND_MARGIN = 10
 FOREGROUND_COMPONENT_GAP = 20
+RESIZE_SIZE = 240
+SKIP_DEFAULT = 0
 
 
 def run_command(command: list[str]) -> None:
@@ -114,6 +116,51 @@ def process_foreground_frame(image_path: Path) -> Path:
 def modify_with_foreground_masks(files: list[Path], workers: int) -> list[Path]:
     with ThreadPoolExecutor(max_workers=workers) as executor:
         return list(executor.map(process_foreground_frame, files))
+
+
+def resize_frame(source_path: Path, target_path: Path, resize_size: int) -> Path:
+    with Image.open(source_path) as source:
+        width, height = source.size
+        scale = resize_size / max(width, height)
+        size = (max(1, round(width * scale)), max(1, round(height * scale)))
+        resized = source.resize(size, Image.Resampling.LANCZOS)
+        resized.save(target_path, format="PNG")
+    return target_path
+
+
+def prepare_merge_frames(
+    files: list[Path],
+    frames_dir: Path,
+    resize_size: int,
+    skip: int,
+    count: int,
+    workers: int,
+) -> Path:
+    with Image.open(files[0]) as first_frame:
+        width, height = first_frame.size
+    if resize_size >= min(width, height):
+        raise ValueError(
+            f"resize must be smaller than the input frame dimensions ({width}x{height})"
+        )
+
+    selected = files[:: skip + 1][:count]
+    merge_dir = frames_dir / "_merge"
+    merge_dir.mkdir(exist_ok=True)
+    for path in merge_dir.glob("*.png"):
+        path.unlink()
+    targets = [
+        merge_dir / f"{index:08d}.png" for index in range(1, len(selected) + 1)
+    ]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(
+            executor.map(
+                resize_frame,
+                selected,
+                targets,
+                [resize_size] * len(selected),
+            )
+        )
+    return merge_dir
 
 
 def foreground_mask(image_path: Path) -> Image.Image:
@@ -243,6 +290,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="region to clear; without this option, automatically keep outlines",
     )
+    parser.add_argument(
+        "--resize",
+        type=int,
+        default=RESIZE_SIZE,
+        metavar="PIXEL",
+        help=f"maximum output frame dimension (default: {RESIZE_SIZE})",
+    )
+    parser.add_argument(
+        "--skip",
+        type=int,
+        default=SKIP_DEFAULT,
+        metavar="N",
+        help=f"skip N frames between selected frames (default: {SKIP_DEFAULT})",
+    )
+    parser.add_argument(
+        "--count",
+        type=int,
+        default=None,
+        metavar="MAX",
+        help="maximum number of selected frames (default: all)",
+    )
     return parser
 
 
@@ -255,6 +323,12 @@ def main() -> int:
 
     frames_dir = input_path.with_suffix("")
     try:
+        if args.resize <= 0:
+            raise ValueError("resize must be greater than zero")
+        if args.skip < 0:
+            raise ValueError("skip must be zero or greater")
+        if args.count is not None and args.count <= 0:
+            raise ValueError("count must be greater than zero")
         regions = []
         for values in args.region:
             region = tuple(values)
@@ -271,17 +345,35 @@ def main() -> int:
             output_mp4 = input_path.with_name(f"{input_path.stem}_redo.mp4")
             output_gif = input_path.with_name(f"{input_path.stem}_redo.gif")
             modify_frames(files, regions, workers)
-            rebuild_video(str(frames_dir / FRAME_PATTERN), output_mp4, output_gif, rate)
+            merge_dir = prepare_merge_frames(
+                files,
+                frames_dir,
+                args.resize,
+                args.skip,
+                args.count or len(files),
+                workers,
+            )
+            rebuild_video(str(merge_dir / FRAME_PATTERN), output_mp4, output_gif, rate)
         else:
-            modify_with_foreground_masks(files, workers)
+            and_files = modify_with_foreground_masks(files, workers)
             output_mp4 = input_path.with_name(f"{input_path.stem}_and.mp4")
             output_gif = input_path.with_name(f"{input_path.stem}_and.gif")
-            rebuild_video(str(frames_dir / "%08d_and.png"), output_mp4, output_gif, rate)
+            merge_dir = prepare_merge_frames(
+                and_files,
+                frames_dir,
+                args.resize,
+                args.skip,
+                args.count or len(and_files),
+                workers,
+            )
+            rebuild_video(str(merge_dir / FRAME_PATTERN), output_mp4, output_gif, rate)
     except (RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 
+    merged_count = len(list(merge_dir.glob("*.png")))
     print(f"frames: {frames_dir} ({len(files)} PNG files)")
+    print(f"merged frames: {merged_count} ({merge_dir})")
     print(f"created: {output_mp4}")
     print(f"created: {output_gif}")
     return 0
