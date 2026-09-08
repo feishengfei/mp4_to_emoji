@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -234,28 +235,8 @@ def input_frame_rate(input_path: Path) -> str:
 
 
 def rebuild_video(
-    input_pattern: str, output_mp4: Path, output_gif: Path, rate: str
+    input_pattern: str, output_gif: Path, rate: str
 ) -> None:
-    run_command(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-framerate",
-            rate,
-            "-i",
-            input_pattern,
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
-            "-movflags",
-            "+faststart",
-            str(output_mp4),
-        ]
-    )
     run_command(
         [
             "ffmpeg",
@@ -311,11 +292,17 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="MAX",
         help="maximum number of selected frames (default: all)",
     )
+    parser.add_argument(
+        "--keep",
+        action='store_true',
+        help="(default: keep middle product png files after work done)",
+    )
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
+
     input_path = args.input.expanduser().resolve()
     if not input_path.is_file():
         print(f"input file does not exist: {input_path}", file=sys.stderr)
@@ -342,7 +329,6 @@ def main() -> int:
         workers = min(os.cpu_count() or 1, len(files))
         rate = input_frame_rate(input_path)
         if regions:
-            output_mp4 = input_path.with_name(f"{input_path.stem}_redo.mp4")
             output_gif = input_path.with_name(f"{input_path.stem}_redo.gif")
             modify_frames(files, regions, workers)
             merge_dir = prepare_merge_frames(
@@ -353,10 +339,9 @@ def main() -> int:
                 args.count or len(files),
                 workers,
             )
-            rebuild_video(str(merge_dir / FRAME_PATTERN), output_mp4, output_gif, rate)
+            rebuild_video(str(merge_dir / FRAME_PATTERN), output_gif, rate)
         else:
             and_files = modify_with_foreground_masks(files, workers)
-            output_mp4 = input_path.with_name(f"{input_path.stem}_and.mp4")
             output_gif = input_path.with_name(f"{input_path.stem}_and.gif")
             merge_dir = prepare_merge_frames(
                 and_files,
@@ -366,7 +351,7 @@ def main() -> int:
                 args.count or len(and_files),
                 workers,
             )
-            rebuild_video(str(merge_dir / FRAME_PATTERN), output_mp4, output_gif, rate)
+            rebuild_video(str(merge_dir / FRAME_PATTERN), output_gif, rate)
     except (RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
@@ -374,8 +359,10 @@ def main() -> int:
     merged_count = len(list(merge_dir.glob("*.png")))
     print(f"frames: {frames_dir} ({len(files)} PNG files)")
     print(f"merged frames: {merged_count} ({merge_dir})")
-    print(f"created: {output_mp4}")
     print(f"created: {output_gif}")
+
+    if not args.keep:
+        shutil.rmtree(frames_dir)
     return 0
 
 
