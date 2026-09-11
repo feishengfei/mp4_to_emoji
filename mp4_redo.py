@@ -297,6 +297,11 @@ def build_parser() -> argparse.ArgumentParser:
         action='store_true',
         help="(default: keep middle product png files after work done)",
     )
+    parser.add_argument(
+        "--manual",
+        action='store_true',
+        help="(default: auto process. otherwise manually rm bg on middleware product.)",
+    )
     return parser
 
 
@@ -341,7 +346,10 @@ def main() -> int:
             )
             rebuild_video(str(merge_dir / FRAME_PATTERN), output_gif, rate)
         else:
-            and_files = modify_with_foreground_masks(files, workers)
+            if not args.manual:
+                and_files = modify_with_foreground_masks(files, workers)
+            else:
+                and_files = files
             output_gif = input_path.with_name(f"{input_path.stem}_and.gif")
             merge_dir = prepare_merge_frames(
                 and_files,
