@@ -137,14 +137,37 @@ def prepare_merge_frames(
     count: int,
     workers: int,
 ) -> Path:
+    orig_size_min = 0
     with Image.open(files[0]) as first_frame:
         width, height = first_frame.size
+        orig_size_min = min(width, height)
     if resize_size >= min(width, height):
         raise ValueError(
             f"resize must be smaller than the input frame dimensions ({width}x{height})"
         )
 
+
     selected = files[:: skip + 1][:count]
+
+    # orig sized png in xxx_orig
+    orig_dir = frames_dir / "_orig"
+    orig_dir.mkdir(exist_ok=True)
+    for path in orig_dir.glob("*.png"):
+        path.unlink()
+    targets_orig = [
+        orig_dir / f"{index:08d}.png" for index in range(1, len(selected) + 1)
+    ]
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        list(
+            executor.map(
+                resize_frame,
+                selected,
+                targets_orig,
+                [orig_size_min] * len(selected),
+            )
+        )
+
+    # resized png in xxx_merge
     merge_dir = frames_dir / "_merge"
     merge_dir.mkdir(exist_ok=True)
     for path in merge_dir.glob("*.png"):
