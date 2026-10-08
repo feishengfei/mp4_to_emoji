@@ -61,8 +61,8 @@ def extract_frames(input_path: Path, frames_dir: Path) -> list[Path]:
             "-y",
             "-i",
             str(input_path),
-            "-vsync",
-            "0",
+            "-fps_mode",
+            "passthrough",
             str(frames_dir / FRAME_PATTERN),
         ]
     )
