@@ -382,7 +382,8 @@ def main() -> int:
                 args.count or len(and_files),
                 workers,
             )
-            rebuild_video(str(merge_dir / FRAME_PATTERN), output_gif, rate)
+            if not args.manual:
+                rebuild_video(str(merge_dir / FRAME_PATTERN), output_gif, rate)
     except (RuntimeError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
